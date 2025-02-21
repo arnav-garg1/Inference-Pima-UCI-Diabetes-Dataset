@@ -1,0 +1,270 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+import os
+from tqdm import tqdm  # Using standard tqdm
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+import timm
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from helper import accuracy  # Assumes helper.py contains an accuracy(logits, labels) function
+from torchvision.transforms import ToPILImage
+
+# ----------------------------
+# Configuration
+# ----------------------------
+class CFG:
+    epochs = 2
+    lr = 0.001
+    batch_size = 16
+    img_size = 224
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# ----------------------------
+# Data Loading & Preprocessing from CSV
+# ----------------------------
+data = pd.read_csv("https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv",
+                   header=None)
+X = data.iloc[:, :-1].values   # shape [N, 8]
+y = data.iloc[:, -1].values    # shape [N, ], binary labels (0 or 1)
+
+# Split data into train, validation, and test sets
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
+X_valid, X_test, y_valid, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# ----------------------------
+# Create a Synthetic Image from a Data Row
+# ----------------------------
+def row_to_image(row):
+    # Use the first 3 features to fill the 3 channels.
+    c0 = np.full((CFG.img_size, CFG.img_size), row[0], dtype=np.float32)
+    c1 = np.full((CFG.img_size, CFG.img_size), row[1], dtype=np.float32)
+    c2 = np.full((CFG.img_size, CFG.img_size), row[2], dtype=np.float32)
+    img = np.stack([c0, c1, c2], axis=0)  # shape: [3, 224, 224]
+    return img
+
+# ----------------------------
+# Custom Dataset for CSV Data
+# ----------------------------
+from torchvision.transforms import ToPILImage
+
+class PimaImageDataset(Dataset):
+    def __init__(self, X_data, y_data, transform=None):
+        self.X_data = X_data
+        self.y_data = y_data
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.X_data)
+    
+    def __getitem__(self, idx):
+        row = self.X_data[idx]
+        label = self.y_data[idx]
+        img = row_to_image(row)  # returns shape: (3, 224, 224)
+        # Transpose the image to shape (224, 224, 3) for PIL conversion
+        pil_img = ToPILImage()(img.transpose(1, 2, 0))
+        if self.transform:
+            pil_img = self.transform(pil_img)
+        # For CrossEntropyLoss, label should be a long integer
+        return pil_img, torch.tensor(label, dtype=torch.long)
+
+
+# ----------------------------
+# Define Transformations (using ImageNet stats)
+# ----------------------------
+train_transform = T.Compose([
+    T.Resize((CFG.img_size, CFG.img_size)),
+    T.RandomRotation(degrees=(-20, +20)),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+valid_transform = T.Compose([
+    T.Resize((CFG.img_size, CFG.img_size)),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+test_transform = T.Compose([
+    T.Resize((CFG.img_size, CFG.img_size)),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# ----------------------------
+# Create Dataset Objects and Dataloaders
+# ----------------------------
+trainset = PimaImageDataset(X_train, y_train, transform=train_transform)
+validset = PimaImageDataset(X_valid, y_valid, transform=valid_transform)
+testset  = PimaImageDataset(X_test,  y_test, transform=test_transform)
+
+trainloader = DataLoader(trainset, batch_size=CFG.batch_size, shuffle=True)
+validloader = DataLoader(validset, batch_size=CFG.batch_size, shuffle=True)
+testloader  = DataLoader(testset,  batch_size=CFG.batch_size, shuffle=False)
+
+# ----------------------------
+# Trainer Class (Using Provided Format)
+# ----------------------------
+class PneumoniaTrainer:
+    def __init__(self, criterion, optimizer, scheduler=None):
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+    def train_batch_loop(self, model, trainloader):
+        train_acc = 0.0
+        train_loss = 0.0
+        for images, labels in tqdm(trainloader, leave=False):
+            images, labels = images.to(device), labels.to(device)
+            logits = model(images)
+            loss = self.criterion(logits, labels)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            train_loss += loss.item()
+            train_acc += accuracy(logits, labels)
+        return train_acc / len(trainloader), train_loss / len(trainloader)
+
+    def valid_batch_loop(self, model, validloader):
+        valid_acc = 0.0
+        valid_loss = 0.0
+        for images, labels in tqdm(validloader, leave=False):
+            images, labels = images.to(device), labels.to(device)
+            logits = model(images)
+            loss = self.criterion(logits, labels)
+            valid_loss += loss.item()
+            valid_acc += accuracy(logits, labels)
+        return valid_acc / len(validloader), valid_loss / len(validloader)
+
+    def fit(self, model, trainloader, validloader, epochs, model_name):
+        model = model.to(device)
+        valid_min_loss = np.inf
+        for i in range(epochs):
+            model.train()
+            avg_train_acc, avg_train_loss = self.train_batch_loop(model, trainloader)
+            model.eval()
+            avg_valid_acc, avg_valid_loss = self.valid_batch_loop(model, validloader)
+
+            if avg_valid_loss <= valid_min_loss:
+                print(f"Epoch {i+1}: Valid loss decreased {valid_min_loss:.4f} --> {avg_valid_loss:.4f}")
+                torch.save(model.state_dict(), f'best_model_{model_name}.pt')
+                valid_min_loss = avg_valid_loss
+
+            print(f"Epoch {i+1} | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.4f}")
+            print(f"Epoch {i+1} | Valid Loss: {avg_valid_loss:.4f} | Valid Acc: {avg_valid_acc:.4f}")
+
+    def evaluate(self, model, testloader, model_name):
+        model.load_state_dict(torch.load(f'best_model_{model_name}.pt'))
+        model.eval()
+        avg_test_acc, avg_test_loss = self.valid_batch_loop(model, testloader)
+        print(f"Test Loss: {avg_test_loss:.4f}")
+        print(f"Test Acc: {avg_test_acc:.4f}")
+        return avg_test_loss, avg_test_acc
+
+# ----------------------------
+# Define Pretrained Models using timm
+# ----------------------------
+models_dict = {
+    "ResNet": timm.create_model('resnet18', pretrained=True),
+    "ViT": timm.create_model('vit_base_patch16_224', pretrained=True),
+    "DenseNet": timm.create_model('densenet121', pretrained=True)
+}
+
+# Modify the classifier for each model (using 2 outputs for binary classification)
+for model_name, model in models_dict.items():
+    if model_name == "DenseNet":
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, 2)
+    elif model_name == "ResNet":
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, 2)
+    elif model_name == "ViT":
+        in_features = model.head.in_features  # Use model.head for ViT
+        model.head = nn.Linear(in_features, 2)
+
+# ----------------------------
+# Set Optimizer, Criterion, and Train/Evaluate Models
+# ----------------------------
+criterion = nn.CrossEntropyLoss()
+results = {}
+
+for model_name, model in models_dict.items():
+    optimizer = torch.optim.Adam(model.parameters(), lr=CFG.lr)
+    trainer = PneumoniaTrainer(criterion, optimizer)
+    print(f"\nTraining {model_name} model...")
+    trainer.fit(model, trainloader, validloader, epochs=CFG.epochs, model_name=model_name)
+    test_loss, test_acc = trainer.evaluate(model, testloader, model_name)
+    results[model_name] = {"loss": test_loss, "accuracy": test_acc}
+
+# ----------------------------
+# Plot Bar Charts for Test Accuracy and Loss
+# ----------------------------
+names = list(results.keys())
+accuracies = [results[name]["accuracy"] for name in names]
+losses = [results[name]["loss"] for name in names]
+
+fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+ax[0].bar(names, accuracies, color='skyblue')
+ax[0].set_title("Test Accuracy for Each Model")
+ax[0].set_ylabel("Accuracy")
+ax[0].set_ylim([0, 1])
+ax[1].bar(names, losses, color='salmon')
+ax[1].set_title("Test Loss for Each Model")
+ax[1].set_ylabel("Loss")
+plt.show()
+
+
+# ----------------------------
+# Plot ROC and Youden's J Curves for Each Model
+# ----------------------------
+fpr = {}
+tpr = {}
+roc_auc = {}
+youdens = {}
+thresholds_dict = {}  # Store each model's thresholds
+
+for model_name, model in models_dict.items():
+    model.load_state_dict(torch.load(f'best_model_{model_name}.pt'))
+    model.eval()
+    true_labels = []
+    predicted_probs = []
+    for images, labels in testloader:
+        images = images.to(device)
+        labels = labels.to(device)
+        logits = model(images)
+        probs = F.softmax(logits, dim=1)[:, 1].cpu().detach().numpy()
+        true_labels.extend(labels.cpu().numpy())
+        predicted_probs.extend(probs)
+        
+    fpr[model_name], tpr[model_name], thresholds = roc_curve(true_labels, predicted_probs)
+    thresholds_dict[model_name] = thresholds  # store thresholds for this model
+    roc_auc[model_name] = auc(fpr[model_name], tpr[model_name])
+    youdens[model_name] = tpr[model_name] - fpr[model_name]
+
+# Plot ROC Curves
+plt.figure(figsize=(10, 7))
+for model_name in models_dict.keys():
+    plt.plot(fpr[model_name], tpr[model_name], label=f'{model_name} (AUC = {roc_auc[model_name]:.2f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc='lower right')
+plt.show()
+
+# Plot Youden's J Curves using each model's own thresholds
+plt.figure(figsize=(10, 7))
+for model_name in models_dict.keys():
+    plt.plot(thresholds_dict[model_name], youdens[model_name],
+             label=f"{model_name} (Max J = {max(youdens[model_name]):.2f})")
+plt.xlabel("Threshold")
+plt.ylabel("Youden's J (Sensitivity - FPR)")
+plt.title("Youden's J Curves")
+plt.legend(loc='best')
+plt.show()
